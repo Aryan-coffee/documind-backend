@@ -68,6 +68,10 @@ class AlertRequest(BaseModel):
 def root():
     return {"status": "DocuMind AI v2.0 Running", "features": ["chat","image","quiz","compare","website","youtube","resume","data","alerts"]}
 
+@app.get("/health")
+def health():
+    return {"status": "ok", "timestamp": str(__import__("datetime").datetime.now())}
+
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), session_id: str = "default", db: Session = Depends(get_db)):
     contents = await file.read()
@@ -264,6 +268,7 @@ async def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
 
 
 
