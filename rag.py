@@ -2,7 +2,6 @@
 import io
 import json
 import threading
-import numpy as np
 from dotenv import load_dotenv
 from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -12,10 +11,10 @@ from langchain_groq import ChatGroq
 
 load_dotenv()
 
-FAISS_PATH = "faiss_store"
+_embeddings = None
 _lock = threading.Lock()
 _query_cache = {}
-_embeddings = None
+_session_stores = {}
 
 def get_embeddings():
     global _embeddings
@@ -37,33 +36,18 @@ def get_llm():
 
 class RAGSystem:
     def __init__(self):
-        self.vectorstore = None
-        self.documents = {}
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50
-        )
-        self._load_faiss()
+        self.global_documents = {}
 
-    def _load_faiss(self):
-        try:
-            if os.path.exists(FAISS_PATH):
-                self.vectorstore = FAISS.load_local(
-                    FAISS_PATH, get_embeddings(),
-                    allow_dangerous_deserialization=True
-                )
-                print("FAISS loaded from disk")
-        except Exception as e:
-            print(f"FAISS load error: {e}")
+    def get_session_store(self, session_id: str):
+        if session_id not in _session_stores:
+            _session_stores[session_id] = {
+                "vectorstore": None,
+                "documents": {},
+                "history": []
+            }
+        return _session_stores[session_id]
 
-    def _save_faiss(self):
-        try:
-            if self.vectorstore:
-                self.vectorstore.save_local(FAISS_PATH)
-        except Exception as e:
-            print(f"FAISS save error: {e}")
-
-    def process_pdf(self, contents, filename):
+    def process_pdf(self, contents, filename, session_id="default"):
         try:
             pdf_reader = PdfReader(io.BytesIO(contents))
             text = ""
@@ -73,11 +57,16 @@ class RAGSystem:
                     text += t + "\n"
             if not text.strip():
                 return {"error": "No text found in PDF"}
-            chunks = self.text_splitter.split_text(text)
-            chunks = chunks[:50]
+
+            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+            chunks = splitter.split_text(text)
+            chunks = chunks[:80]
+
+            session = self.get_session_store(session_id)
+
             with _lock:
-                if self.vectorstore is None:
-                    self.vectorstore = FAISS.from_texts(
+                if session["vectorstore"] is None:
+                    session["vectorstore"] = FAISS.from_texts(
                         chunks, get_embeddings(),
                         metadatas=[{"source": filename}] * len(chunks)
                     )
@@ -86,31 +75,36 @@ class RAGSystem:
                         chunks, get_embeddings(),
                         metadatas=[{"source": filename}] * len(chunks)
                     )
-                    self.vectorstore.merge_from(new_vs)
-                self._save_faiss()
-            self.documents[filename] = len(chunks)
+                    session["vectorstore"].merge_from(new_vs)
+
+            session["documents"][filename] = len(chunks)
             return {
                 "message": "PDF processed successfully",
                 "chunks": len(chunks),
-                "total_documents": len(self.documents)
+                "total_documents": len(session["documents"])
             }
         except Exception as e:
             return {"error": str(e)}
 
-    def query(self, question, history=None, mode="normal", language="English"):
-        if self.vectorstore is None:
-            return {"error": "No documents uploaded yet."}
-        cache_key = question.strip().lower()[:80] + mode + language
+    def query(self, question, session_id="default", history=None, mode="normal", language="English"):
+        session = self.get_session_store(session_id)
+        if session["vectorstore"] is None:
+            return {"error": "No documents uploaded yet. Please upload a PDF first."}
+
+        cache_key = session_id + question.strip().lower()[:80] + mode
         if cache_key in _query_cache:
             return _query_cache[cache_key]
+
         try:
-            docs = self.vectorstore.as_retriever(search_kwargs={"k": 2}).invoke(question)
+            docs = session["vectorstore"].as_retriever(search_kwargs={"k": 2}).invoke(question)
             context = "\n\n".join([d.page_content for d in docs])
             sources = list(set([d.metadata.get("source", "Unknown") for d in docs]))
+
             history_text = ""
             if history:
                 for m in history[-4:]:
                     history_text += m["role"] + ": " + m["content"][:100] + "\n"
+
             if mode == "student":
                 style = "Simple words, analogies, friendly."
             elif mode == "professor":
@@ -119,23 +113,27 @@ class RAGSystem:
                 style = "Bullet points only, concise."
             else:
                 style = "Clear, helpful, professional."
-            prompt = "You are DocuMind AI.\nStyle: " + style + "\nLanguage: " + language + "\n\nContext:\n" + context + "\n\nHistory:\n" + history_text + "\nUser: " + question + "\nDocuMind AI:"
+
+            prompt = "You are DocuMind AI. Answer ONLY based on the provided document context. Do not use any external knowledge.\n\nStyle: " + style + "\nLanguage: " + language + "\n\nDocument Context:\n" + context + "\n\nHistory:\n" + history_text + "\nUser: " + question + "\nDocuMind AI:"
+
             llm = get_llm()
             response = llm.invoke(prompt)
             answer = response.content
             confidence = min(92, max(50, len(docs) * 25))
             result = {"answer": answer, "sources": sources, "confidence": confidence, "mode": mode}
+
             if len(_query_cache) < 50:
                 _query_cache[cache_key] = result
             return result
         except Exception as e:
             return {"error": str(e)}
 
-    def compare_documents(self, question, doc1, doc2):
-        if self.vectorstore is None:
+    def compare_documents(self, question, doc1, doc2, session_id="default"):
+        session = self.get_session_store(session_id)
+        if session["vectorstore"] is None:
             return {"error": "No documents uploaded"}
         try:
-            docs = self.vectorstore.as_retriever(search_kwargs={"k": 4}).invoke(question)
+            docs = session["vectorstore"].as_retriever(search_kwargs={"k": 4}).invoke(question)
             doc1_ctx = "\n".join([d.page_content for d in docs if d.metadata.get("source") == doc1]) or "No content found"
             doc2_ctx = "\n".join([d.page_content for d in docs if d.metadata.get("source") == doc2]) or "No content found"
             prompt = "Compare these documents.\n\nQuestion: " + question + "\n\nDoc1 (" + doc1 + "):\n" + doc1_ctx[:2000] + "\n\nDoc2 (" + doc2 + "):\n" + doc2_ctx[:2000] + "\n\nGive similarities, differences, and recommendation.\n\nDocuMind AI:"
@@ -145,13 +143,14 @@ class RAGSystem:
         except Exception as e:
             return {"error": str(e)}
 
-    def generate_quiz(self, num_questions=5):
-        if self.vectorstore is None:
+    def generate_quiz(self, num_questions=5, session_id="default"):
+        session = self.get_session_store(session_id)
+        if session["vectorstore"] is None:
             return {"error": "No documents uploaded"}
         try:
-            docs = self.vectorstore.as_retriever(search_kwargs={"k": 4}).invoke("main concepts key points")
+            docs = session["vectorstore"].as_retriever(search_kwargs={"k": 4}).invoke("main concepts key points")
             context = "\n\n".join([d.page_content for d in docs])
-            prompt = "Generate " + str(num_questions) + " MCQ questions. Return ONLY valid JSON:\n{\"questions\": [{\"question\": \"text?\", \"options\": [\"A) opt1\", \"B) opt2\", \"C) opt3\", \"D) opt4\"], \"correct\": \"A\", \"explanation\": \"why\"}]}\n\nContext:\n" + context[:3000]
+            prompt = "Generate " + str(num_questions) + " MCQ questions from this document ONLY. Return ONLY valid JSON:\n{\"questions\": [{\"question\": \"text?\", \"options\": [\"A) opt1\", \"B) opt2\", \"C) opt3\", \"D) opt4\"], \"correct\": \"A\", \"explanation\": \"why\"}]}\n\nDocument:\n" + context[:3000]
             llm = get_llm()
             response = llm.invoke(prompt)
             text = response.content.strip()
@@ -163,11 +162,12 @@ class RAGSystem:
         except Exception as e:
             return {"error": str(e)}
 
-    def get_document_summary(self, filename):
-        if self.vectorstore is None:
+    def get_document_summary(self, filename, session_id="default"):
+        session = self.get_session_store(session_id)
+        if session["vectorstore"] is None:
             return {"error": "No documents uploaded"}
         try:
-            docs = self.vectorstore.as_retriever(search_kwargs={"k": 4}).invoke("summary overview main topics")
+            docs = session["vectorstore"].as_retriever(search_kwargs={"k": 4}).invoke("summary overview main topics")
             context = "\n\n".join([d.page_content for d in docs if d.metadata.get("source") == filename])
             if not context:
                 context = "\n\n".join([d.page_content for d in docs])
@@ -183,12 +183,19 @@ class RAGSystem:
         except Exception as e:
             return {"error": str(e)}
 
-    def get_documents(self):
-        return {"documents": list(self.documents.keys()), "total": len(self.documents)}
+    def get_documents(self, session_id="default"):
+        session = self.get_session_store(session_id)
+        return {"documents": list(session["documents"].keys()), "total": len(session["documents"])}
 
-    def delete_document(self, doc_name):
-        if doc_name in self.documents:
-            del self.documents[doc_name]
-            return {"message": "Document removed"}
+    def delete_document(self, doc_name, session_id="default"):
+        session = self.get_session_store(session_id)
+        if doc_name in session["documents"]:
+            del session["documents"][doc_name]
+            session["vectorstore"] = None
+            return {"message": "Document removed — please re-upload other documents"}
         return {"error": "Document not found"}
 
+    def clear_session(self, session_id="default"):
+        if session_id in _session_stores:
+            del _session_stores[session_id]
+        return {"message": "Session cleared"}

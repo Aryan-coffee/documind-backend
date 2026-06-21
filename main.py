@@ -1,7 +1,6 @@
 ﻿from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
-from fastapi.responses import StreamingResponse
-from sse_starlette.sse import EventSourceResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 from rag import RAGSystem
@@ -12,6 +11,8 @@ import uvicorn
 import json
 import pandas as pd
 import io
+import urllib.parse
+import random
 from pypdf import PdfReader
 
 app = FastAPI(title="DocuMind AI API v2.0")
@@ -46,6 +47,7 @@ class ImageRequest(BaseModel):
 
 class QuizRequest(BaseModel):
     num_questions: int = 5
+    session_id: str = "default"
 
 class WebsiteRequest(BaseModel):
     url: str
@@ -57,26 +59,24 @@ class YouTubeRequest(BaseModel):
     question: str
     session_id: str = "default"
 
-class DataRequest(BaseModel):
-    question: str
-    session_id: str = "default"
-
 class AlertRequest(BaseModel):
     filename: str
+    session_id: str = "default"
 
 @app.get("/")
 def root():
-    return {"status": "DocuMind AI v2.0 Running", "features": ["chat","image","quiz","compare","website","youtube","resume","data","alerts"]}
+    return {"status": "DocuMind AI v2.0 Running"}
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "timestamp": str(__import__("datetime").datetime.now())}
+    import datetime
+    return {"status": "ok", "timestamp": str(datetime.datetime.now())}
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), session_id: str = "default", db: Session = Depends(get_db)):
     contents = await file.read()
     if file.filename.endswith(".pdf"):
-        result = rag.process_pdf(contents, file.filename)
+        result = rag.process_pdf(contents, file.filename, session_id)
         if "error" not in result:
             db.add(Document(session_id=session_id, filename=file.filename, chunks=result.get("chunks", 0)))
             db.commit()
@@ -97,16 +97,82 @@ async def upload(file: UploadFile = File(...), session_id: str = "default", db: 
 async def chat(req: ChatRequest, db: Session = Depends(get_db)):
     history = db.query(ChatHistory).filter(ChatHistory.session_id == req.session_id).order_by(ChatHistory.timestamp).limit(10).all()
     history_list = [{"role": str(h.role), "content": str(h.content)} for h in history]
-    result = rag.query(req.question, history_list, req.mode, req.language)
+    result = rag.query(req.question, req.session_id, history_list, req.mode, req.language)
     if "error" not in result:
         db.add(ChatHistory(session_id=req.session_id, role="Human", content=req.question))
         db.add(ChatHistory(session_id=req.session_id, role="DocuMind AI", content=result["answer"], sources=json.dumps(result.get("sources", []))))
         db.commit()
     return result
 
+@app.post("/chat-stream")
+async def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
+    history = db.query(ChatHistory).filter(ChatHistory.session_id == req.session_id).order_by(ChatHistory.timestamp).limit(10).all()
+    history_list = [{"role": str(h.role), "content": str(h.content)} for h in history]
+
+    async def generate():
+        try:
+            from langchain_groq import ChatGroq
+            import os
+            from rag import get_embeddings, _session_stores
+
+            session = _session_stores.get(req.session_id, {})
+            vectorstore = session.get("vectorstore") if session else None
+
+            if vectorstore is None:
+                yield "data: No documents uploaded. Please upload a PDF first.\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            docs = vectorstore.as_retriever(search_kwargs={"k": 2}).invoke(req.question)
+            context = "\n\n".join([d.page_content for d in docs])
+            sources = list(set([d.metadata.get("source", "Unknown") for d in docs]))
+            sources_str = ",".join(sources)
+
+            history_text = ""
+            for m in history_list[-4:]:
+                history_text += m["role"] + ": " + m["content"][:100] + "\n"
+
+            if req.mode == "student":
+                style = "Simple words, analogies, friendly."
+            elif req.mode == "professor":
+                style = "Detailed academic analysis."
+            elif req.mode == "summary":
+                style = "Bullet points only, concise."
+            else:
+                style = "Clear, helpful, professional."
+
+            prompt = "You are DocuMind AI. Answer ONLY based on the provided document context.\n\nStyle: " + style + "\nLanguage: " + req.language + "\n\nDocument Context:\n" + context + "\n\nHistory:\n" + history_text + "\nUser: " + req.question + "\nDocuMind AI:"
+
+            llm = ChatGroq(
+                groq_api_key=os.getenv("GROQ_API_KEY"),
+                model_name="llama-3.3-70b-versatile",
+                temperature=0.1,
+                max_tokens=1024,
+                streaming=True
+            )
+
+            full_response = ""
+            async for chunk in llm.astream(prompt):
+                if chunk.content:
+                    full_response += chunk.content
+                    yield f"data: {chunk.content}\n\n"
+
+            yield f"data: [SOURCES]{sources_str}[/SOURCES]\n\n"
+            yield "data: [DONE]\n\n"
+
+            db.add(ChatHistory(session_id=req.session_id, role="Human", content=req.question))
+            db.add(ChatHistory(session_id=req.session_id, role="DocuMind AI", content=full_response, sources=sources_str))
+            db.commit()
+
+        except Exception as e:
+            yield f"data: Error: {str(e)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
 @app.post("/compare")
 async def compare(req: CompareRequest, db: Session = Depends(get_db)):
-    result = rag.compare_documents(req.question, req.doc1, req.doc2)
+    result = rag.compare_documents(req.question, req.doc1, req.doc2, req.session_id)
     if "answer" in result:
         db.add(ChatHistory(session_id=req.session_id, role="Human", content="[COMPARE] " + req.question))
         db.add(ChatHistory(session_id=req.session_id, role="DocuMind AI", content=result["answer"]))
@@ -115,17 +181,15 @@ async def compare(req: CompareRequest, db: Session = Depends(get_db)):
 
 @app.post("/quiz")
 async def generate_quiz(req: QuizRequest):
-    return rag.generate_quiz(req.num_questions)
+    return rag.generate_quiz(req.num_questions, req.session_id)
 
 @app.get("/summary/{filename}")
-async def get_summary(filename: str):
-    return rag.get_document_summary(filename)
+async def get_summary(filename: str, session_id: str = "default"):
+    return rag.get_document_summary(filename, session_id)
 
 @app.post("/generate-image")
 async def generate_image(req: ImageRequest, db: Session = Depends(get_db)):
     try:
-        import urllib.parse
-        import random
         styles = {
             "realistic": "photorealistic ultra detailed 8k professional",
             "anime": "anime art style vibrant colorful detailed",
@@ -172,12 +236,7 @@ async def analyze_resume_endpoint(file: UploadFile = File(...)):
             text += page.extract_text() or ""
     else:
         text = contents.decode("utf-8", errors="ignore")
-    result = analyze_resume(text)
-    return result
-
-@app.post("/analyze-data")
-async def analyze_data_endpoint(req: DataRequest):
-    return {"error": "Send data_json with the request"}
+    return analyze_resume(text)
 
 @app.post("/analyze-data-json")
 async def analyze_data_json(request: dict):
@@ -187,7 +246,7 @@ async def analyze_data_json(request: dict):
 
 @app.post("/smart-alerts")
 async def smart_alerts(req: AlertRequest):
-    result = rag.get_document_summary(req.filename)
+    result = rag.get_document_summary(req.filename, req.session_id)
     if "error" in result:
         return result
     content = " ".join(result.get("key_points", [])) + " " + result.get("summary", "")
@@ -202,75 +261,16 @@ async def get_history(session_id: str, db: Session = Depends(get_db)):
 async def clear_history(session_id: str, db: Session = Depends(get_db)):
     db.query(ChatHistory).filter(ChatHistory.session_id == session_id).delete()
     db.commit()
-    return {"message": "History cleared"}
+    rag.clear_session(session_id)
+    return {"message": "History and session cleared"}
 
 @app.get("/documents")
-def get_documents():
-    return rag.get_documents()
+def get_documents(session_id: str = "default"):
+    return rag.get_documents(session_id)
 
 @app.delete("/documents/{doc_name}")
-def delete_document(doc_name: str):
-    return rag.delete_document(doc_name)
-
-@app.post("/chat-stream")
-async def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
-    history = db.query(ChatHistory).filter(ChatHistory.session_id == req.session_id).order_by(ChatHistory.timestamp).limit(10).all()
-    history_list = [{"role": str(h.role), "content": str(h.content)} for h in history]
-
-    async def generate():
-        try:
-            from langchain_groq import ChatGroq
-            import os
-            llm = ChatGroq(
-                groq_api_key=os.getenv("GROQ_API_KEY"),
-                model_name="llama-3.3-70b-versatile",
-                temperature=0.1,
-                max_tokens=2048,
-                streaming=True
-            )
-            docs = rag.vectorstore.as_retriever(search_kwargs={"k": 4}).invoke(req.question) if rag.vectorstore else []
-            context = "\n\n".join([d.page_content for d in docs])
-            sources = list(set([d.metadata.get("source", "Unknown") for d in docs]))
-            history_text = ""
-            for m in history_list[-6:]:
-                history_text += m["role"] + ": " + m["content"] + "\n"
-
-            if req.mode == "student":
-                style = "Explain simply, use analogies, friendly tone."
-            elif req.mode == "professor":
-                style = "Detailed academic analysis with technical depth."
-            elif req.mode == "summary":
-                style = "Concise bullet-point summary."
-            else:
-                style = "Helpful, clear, professional."
-
-            prompt = "You are DocuMind AI.\nStyle: " + style + "\nLanguage: " + req.language + "\n\nContext:\n" + context + "\n\nHistory:\n" + history_text + "\nHuman: " + req.question + "\nDocuMind AI:"
-
-            full_response = ""
-            async for chunk in llm.astream(prompt):
-                if chunk.content:
-                    full_response += chunk.content
-                    yield f"data: {chunk.content}\n\n"
-
-            sources_str = ",".join(sources)
-            yield f"data: [SOURCES]{sources_str}[/SOURCES]\n\n"
-            yield "data: [DONE]\n\n"
-
-            db.add(ChatHistory(session_id=req.session_id, role="Human", content=req.question))
-            db.add(ChatHistory(session_id=req.session_id, role="DocuMind AI", content=full_response, sources=str(sources)))
-            db.commit()
-
-        except Exception as e:
-            yield f"data: Error: {str(e)}\n\n"
-            yield "data: [DONE]\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+def delete_document(doc_name: str, session_id: str = "default"):
+    return rag.delete_document(doc_name, session_id)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
-
-
-
-
