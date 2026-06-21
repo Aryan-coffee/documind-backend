@@ -7,6 +7,7 @@ from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 
 load_dotenv()
@@ -16,14 +17,37 @@ _lock = threading.Lock()
 _query_cache = {}
 _session_stores = {}
 
+class SimpleEmbeddings:
+    def embed_documents(self, texts):
+        import hashlib
+        result = []
+        for text in texts:
+            words = text.lower().split()[:100]
+            vec = [0.0] * 384
+            for i, word in enumerate(words):
+                h = int(hashlib.md5(word.encode()).hexdigest(), 16)
+                vec[h % 384] += 1.0
+            norm = sum(x*x for x in vec) ** 0.5
+            if norm > 0:
+                vec = [x/norm for x in vec]
+            result.append(vec)
+        return result
+
+    def embed_query(self, text):
+        return self.embed_documents([text])[0]
+
 def get_embeddings():
     global _embeddings
     if _embeddings is None:
-        _embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True}
-        )
+        try:
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+            _embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+                model_kwargs={"device": "cpu"},
+                encode_kwargs={"normalize_embeddings": True}
+            )
+        except:
+            _embeddings = SimpleEmbeddings()
     return _embeddings
 
 def get_llm():
@@ -199,3 +223,4 @@ class RAGSystem:
         if session_id in _session_stores:
             del _session_stores[session_id]
         return {"message": "Session cleared"}
+
