@@ -86,7 +86,7 @@ class RAGSystem:
         if cache_key in _query_cache:
             return _query_cache[cache_key]
         try:
-            docs = self.vectorstore.as_retriever(search_kwargs={"k": 3}).invoke(question)
+            docs = self.vectorstore.as_retriever(search_kwargs={"k": 2}).invoke(question)
             context = "\n\n".join([d.page_content for d in docs])
             sources = list(set([d.metadata.get("source", "Unknown") for d in docs]))
             history_text = ""
@@ -169,6 +169,7 @@ class RAGSystem:
             del self.documents[doc_name]
             return {"message": "Document removed"}
         return {"error": "Document not found"}
+
 
 
 

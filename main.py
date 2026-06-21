@@ -120,16 +120,17 @@ async def get_summary(filename: str):
 @app.post("/generate-image")
 async def generate_image(req: ImageRequest, db: Session = Depends(get_db)):
     try:
+        import urllib.parse
         styles = {
-            "realistic": "photorealistic, ultra detailed, 8k",
-            "anime": "anime style, vibrant colors, detailed",
-            "cartoon": "cartoon style, colorful, fun",
-            "painting": "oil painting, artistic, masterpiece",
-            "3d": "3D render, octane render, detailed"
+            "realistic": "photorealistic ultra detailed 8k",
+            "anime": "anime style vibrant colors detailed",
+            "cartoon": "cartoon style colorful fun",
+            "painting": "oil painting artistic masterpiece",
+            "3d": "3D render octane render detailed"
         }
-        style_suffix = styles.get(req.style, "photorealistic")
-        full_prompt = (req.prompt + " " + style_suffix).replace(" ", "%20")
-        image_url = "https://image.pollinations.ai/prompt/" + full_prompt + "?width=1024&height=768&nologo=true&enhance=true"
+        style_suffix = styles.get(req.style, "photorealistic ultra detailed")
+        full_prompt = urllib.parse.quote(req.prompt + " " + style_suffix)
+        image_url = "https://image.pollinations.ai/prompt/" + full_prompt + "?width=1024&height=768&nologo=true&enhance=true&seed=" + str(abs(hash(req.prompt)) % 99999)
         db.add(ImageHistory(session_id=req.session_id, prompt=req.prompt, image_url=image_url))
         db.commit()
         return {"image_url": image_url, "prompt": req.prompt, "style": req.style}
@@ -260,6 +261,7 @@ async def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
 
 
 
