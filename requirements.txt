@@ -17,3 +17,4 @@ openpyxl
 youtube-transcript-api
 groq
 numpy
+sentence-transformers
