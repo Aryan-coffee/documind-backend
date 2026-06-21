@@ -265,8 +265,16 @@ async def clear_history(session_id: str, db: Session = Depends(get_db)):
     return {"message": "History and session cleared"}
 
 @app.get("/documents")
-def get_documents(session_id: str = "default"):
-    return rag.get_documents(session_id)
+def get_documents(session_id: str = "default", db: Session = Depends(get_db)):
+    # Memory se lo pehle
+    mem_docs = rag.get_documents(session_id)
+    if mem_docs["total"] > 0:
+        return mem_docs
+    # DB se lo agar memory mein nahi
+    db_docs = db.query(Document).filter(Document.session_id == session_id).all()
+    if db_docs:
+        return {"documents": [d.filename for d in db_docs], "total": len(db_docs)}
+    return {"documents": [], "total": 0}
 
 @app.delete("/documents/{doc_name}")
 def delete_document(doc_name: str, session_id: str = "default"):
@@ -274,3 +282,4 @@ def delete_document(doc_name: str, session_id: str = "default"):
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
