@@ -121,16 +121,19 @@ async def get_summary(filename: str):
 async def generate_image(req: ImageRequest, db: Session = Depends(get_db)):
     try:
         import urllib.parse
+        import random
         styles = {
-            "realistic": "photorealistic ultra detailed 8k",
-            "anime": "anime style vibrant colors detailed",
-            "cartoon": "cartoon style colorful fun",
-            "painting": "oil painting artistic masterpiece",
-            "3d": "3D render octane render detailed"
+            "realistic": "photorealistic ultra detailed 8k professional",
+            "anime": "anime art style vibrant colorful detailed",
+            "cartoon": "cartoon illustration colorful fun bold",
+            "painting": "oil painting artistic impressionist masterpiece",
+            "3d": "3D render CGI octane detailed lighting"
         }
         style_suffix = styles.get(req.style, "photorealistic ultra detailed")
-        full_prompt = urllib.parse.quote(req.prompt + " " + style_suffix)
-        image_url = "https://image.pollinations.ai/prompt/" + full_prompt + "?width=1024&height=768&nologo=true&enhance=true&seed=" + str(abs(hash(req.prompt)) % 99999)
+        combined = req.prompt.strip() + ", " + style_suffix
+        encoded = urllib.parse.quote(combined)
+        seed = random.randint(1, 999999)
+        image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&enhance=true&seed={seed}&model=flux"
         db.add(ImageHistory(session_id=req.session_id, prompt=req.prompt, image_url=image_url))
         db.commit()
         return {"image_url": image_url, "prompt": req.prompt, "style": req.style}
@@ -261,6 +264,7 @@ async def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
 
 
 
